@@ -11,7 +11,7 @@ use crate::{
     args::ArgValues,
     bytecode::{CallResult, VM},
     defer_drop,
-    exception_public::{MontyException, StackFrame},
+    exception_public::{MontyException, SourceMap, StackFrame},
     fstring::FormatError,
     heap::{HeapData, HeapRead},
     intern::{Interns, StaticStrings, StringId},
@@ -184,7 +184,7 @@ impl ExcType {
     ///
     /// The `interns` parameter provides access to interned string content.
     /// Returns a heap-allocated exception value.
-    pub(crate) fn call(self, vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    pub(crate) fn call(self, vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
         defer_drop!(args, vm);
         let exc = match args {
             ArgValues::Empty => Ok(SimpleException::new_none(self)),
@@ -259,19 +259,6 @@ impl ExcType {
         })
     }
 
-    /// Creates a FrozenInstanceError for assigning to a frozen dataclass.
-    ///
-    /// Matches CPython's `dataclasses.FrozenInstanceError` which is a subclass of `AttributeError`.
-    /// Message format: "cannot assign to field 'attr_name'"
-    #[must_use]
-    pub(crate) fn frozen_instance_error(attr_name: &str) -> RunError {
-        SimpleException::new_msg(
-            Self::FrozenInstanceError,
-            format!("cannot assign to field '{attr_name}'"),
-        )
-        .into()
-    }
-
     #[must_use]
     pub(crate) fn type_error_not_sub(type_: Type) -> RunError {
         SimpleException::new_msg(Self::TypeError, format!("'{type_}' object is not subscriptable")).into()
@@ -337,7 +324,7 @@ impl ExcType {
     /// If the key's string conversion fails (e.g. huge LongInt exceeding
     /// `INT_MAX_STR_DIGITS`), falls back to the type name so that a
     /// `KeyError` is always raised rather than a spurious `ValueError`.
-    pub(crate) fn key_error(key: &Value, vm: &VM<'_, '_, impl ResourceTracker>) -> RunError {
+    pub(crate) fn key_error(key: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunError {
         let key_str = match key.py_str(vm) {
             Ok(s) => s.into_owned(),
             Err(_) => format!("<{}>", key.py_type(vm)),
@@ -1091,12 +1078,12 @@ impl ExcType {
         SimpleException::new_msg(Self::ValueError, "negative shift count").into()
     }
 
-    /// Creates an OverflowError for shift count exceeding integer size.
+    /// Creates an OverflowError when converting values to C ssize_t (i64) for operations like length checks.
     ///
     /// Matches CPython's format: `OverflowError: Python int too large to convert to C ssize_t`
     /// Note: CPython uses this message because it tries to convert to ssize_t for the shift amount.
     #[must_use]
-    pub(crate) fn overflow_shift_count() -> RunError {
+    pub(crate) fn overflow_c_ssize_t() -> RunError {
         SimpleException::new_msg(Self::OverflowError, "Python int too large to convert to C ssize_t").into()
     }
 
@@ -1454,7 +1441,7 @@ impl SimpleException {
 }
 
 impl<'h> HeapRead<'h, SimpleException> {
-    pub(crate) fn py_type(&self, vm: &VM<'h, '_, impl ResourceTracker>) -> Type {
+    pub(crate) fn py_type(&self, vm: &VM<'h, impl ResourceTracker>) -> Type {
         Type::Exception(self.get(vm.heap).exc_type)
     }
 }
@@ -1494,11 +1481,7 @@ impl<'h> HeapRead<'h, SimpleException> {
     ///
     /// Handles the `.args` attribute by allocating a tuple containing the message.
     /// Returns `Err(AttributeError)` for all other attributes.
-    pub fn py_getattr(
-        &self,
-        attr: &EitherStr,
-        vm: &mut VM<'h, '_, impl ResourceTracker>,
-    ) -> RunResult<Option<CallResult>> {
+    pub fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<CallResult>> {
         // Fast path: interned strings can be matched by ID
         let is_args = attr
             .static_string()
@@ -1598,15 +1581,45 @@ impl ExceptionRaise {
     ///
     /// Uses `Interns` to resolve `StringId` references to actual strings.
     /// Extracts preview lines from the source code for traceback display.
+    /// Converts this exception into a public `MontyException`, expanding each
+    /// stack frame's raw byte offsets into lines/columns/preview text via a
+    /// caller-provided source lookup.
+    ///
+    /// The caller must supply `source_for` so that frames whose `CodeRange`
+    /// points into a *different* source than the one currently executing can
+    /// still be resolved. In particular, REPL tracebacks can interleave
+    /// frames from multiple snippets (e.g. calling into a function defined
+    /// in an earlier feed); resolving those byte offsets against only the
+    /// current snippet's source would produce wrong line/column/caret
+    /// information. `source_for` is called per unique filename encountered
+    /// in the traceback and its result is cached, so each source is scanned
+    /// at most once regardless of how many frames share it.
     #[must_use]
-    pub fn into_python_exception(self, interns: &Interns, source: &str) -> MontyException {
+    pub fn into_python_exception<'s>(
+        self,
+        interns: &Interns,
+        source_for: impl Fn(&str) -> Option<&'s str>,
+    ) -> MontyException {
+        // Per-filename SourceMap cache. Typical tracebacks touch 1-3 unique
+        // filenames so a tiny `Vec` beats a HashMap on both allocations and
+        // lookup cost.
+        let mut cache: Vec<(StringId, SourceMap<'s>)> = Vec::new();
         let traceback = self
             .frame
             .map(|frame| {
                 let mut frames = Vec::new();
                 let mut current = Some(&frame);
                 while let Some(f) = current {
-                    frames.push(StackFrame::from_raw(f, interns, source));
+                    let fname_id = f.position.filename;
+                    let sm_idx = if let Some(i) = cache.iter().position(|(k, _)| *k == fname_id) {
+                        i
+                    } else {
+                        let fname = interns.get_str(fname_id);
+                        let src = source_for(fname).unwrap_or("");
+                        cache.push((fname_id, SourceMap::new(src)));
+                        cache.len() - 1
+                    };
+                    frames.push(StackFrame::from_raw(f, interns, &cache[sm_idx].1));
                     current = f.parent.as_deref();
                 }
                 // Reverse so outermost frame is first (Python's "most recent call last" ordering)
@@ -1731,10 +1744,19 @@ impl RunError {
     /// Converts this runtime error to a `MontyException` for the public API.
     ///
     /// Internal errors are converted to `RuntimeError` exceptions with no traceback.
+    /// Converts this runtime error into a public `MontyException`.
+    ///
+    /// `source_for` is consulted per unique filename referenced by the
+    /// traceback — see [`ExceptionRaise::into_python_exception`] for why
+    /// this is a lookup rather than a single source string.
     #[must_use]
-    pub fn into_python_exception(self, interns: &Interns, source: &str) -> MontyException {
+    pub fn into_python_exception<'s>(
+        self,
+        interns: &Interns,
+        source_for: impl Fn(&str) -> Option<&'s str>,
+    ) -> MontyException {
         match self {
-            Self::Exc(exc) | Self::UncatchableExc(exc) => exc.into_python_exception(interns, source),
+            Self::Exc(exc) | Self::UncatchableExc(exc) => exc.into_python_exception(interns, source_for),
             Self::Internal(err) => MontyException::runtime_error(format!("Internal error in monty: {err}")),
         }
     }

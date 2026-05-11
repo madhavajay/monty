@@ -26,7 +26,7 @@ use tokio::{
 };
 
 use crate::{
-    convert::{get_docstring, monty_to_py, py_to_monty},
+    convert::{get_docstring, monty_to_py, py_to_monty_value},
     dataclass::DcRegistry,
     exceptions::{MontyError, exc_py_to_monty},
     external::{
@@ -379,10 +379,21 @@ fn dispatch_os_call_py(
             .bind(py)
             .call1((function.to_string(), py_args_tuple, py_kwargs))
         {
-            Ok(result) => match py_to_monty(&result, dc_registry) {
-                Ok(obj) => ExtFunctionResult::Return(obj),
-                Err(err) => ExtFunctionResult::Error(exc_py_to_monty(py, &err)),
-            },
+            Ok(result) => {
+                // Honor the `NOT_HANDLED` sentinel by falling through to the default
+                // unhandled behavior, matching the sync `call_os_callback_parts` path.
+                match crate::get_not_handled(py) {
+                    Ok(not_handled) if result.is(not_handled.bind(py)) => {
+                        return function.on_no_handler(args).into();
+                    }
+                    Ok(_) => {}
+                    Err(err) => return ExtFunctionResult::Error(exc_py_to_monty(py, &err)),
+                }
+                match py_to_monty_value(&result, dc_registry) {
+                    Ok(obj) => ExtFunctionResult::Return(obj),
+                    Err(exc) => ExtFunctionResult::Error(exc),
+                }
+            }
             Err(err) => ExtFunctionResult::Error(exc_py_to_monty(py, &err)),
         }
     })
@@ -425,7 +436,7 @@ fn spawn_coroutine_task(
         match future.await {
             Ok(py_result) => Python::attach(|py| {
                 let bound = py_result.bind(py);
-                (call_id, py_obj_to_ext_result(py, bound, &dc_registry))
+                (call_id, py_obj_to_ext_result(bound, &dc_registry))
             }),
             Err(err) => Python::attach(|py| (call_id, py_err_to_ext_result(py, &err))),
         }

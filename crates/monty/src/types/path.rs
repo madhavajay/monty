@@ -4,7 +4,13 @@
 //! (require `OsAccess` implementation). Pure methods are handled directly by the VM,
 //! while filesystem methods yield external function calls for the host to resolve.
 
-use std::{fmt::Write, mem};
+use std::{
+    cell::Cell,
+    collections::hash_map::DefaultHasher,
+    fmt::Write,
+    hash::{Hash, Hasher},
+    mem,
+};
 
 use ahash::AHashSet;
 use smallvec::SmallVec;
@@ -14,6 +20,7 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, RunResult, SimpleException},
+    hash::HashValue,
     heap::{DropWithHeap, Heap, HeapData, HeapId, HeapItem, HeapRead},
     intern::{Interns, StaticStrings},
     os::OsFunction,
@@ -29,10 +36,22 @@ use crate::{
 ///
 /// The path is immutable - all operations that would modify the path return
 /// new `Path` objects or strings.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Path {
     /// The normalized path string.
     path: String,
+    /// Lazily-computed Python hash. Paths are immutable (all "modifying"
+    /// operations return new `Path` objects). Skipped on serde — see
+    /// [`super::Str::cached_hash`] for the rationale.
+    #[serde(skip)]
+    cached_hash: Cell<Option<HashValue>>,
+}
+
+impl PartialEq for Path {
+    /// Compares only the path string — `cached_hash` is a pure optimisation.
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+    }
 }
 
 impl Path {
@@ -45,6 +64,7 @@ impl Path {
     pub fn new(path: String) -> Self {
         Self {
             path: normalize_path(path),
+            cached_hash: Cell::new(None),
         }
     }
 
@@ -261,7 +281,7 @@ impl Path {
     /// - `Path('a')` returns `Path('a')`
     /// - `Path('a', 'b', 'c')` returns `Path('a/b/c')`
     /// - If an absolute path appears, it replaces everything before it.
-    pub fn init(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    pub fn init(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
         let pos_args = args.into_pos_only("Path", vm.heap)?;
         defer_drop!(pos_args, vm);
 
@@ -284,7 +304,7 @@ impl Path {
 }
 
 /// Extracts a string from a Value for use as a path.
-fn extract_path_string<'a>(val: &Value, vm: &'a VM<'_, '_, impl ResourceTracker>) -> RunResult<&'a str> {
+fn extract_path_string<'a>(val: &Value, vm: &'a VM<'_, impl ResourceTracker>) -> RunResult<&'a str> {
     match val {
         Value::InternString(string_id) => Ok(vm.interns.get_str(*string_id)),
         Value::Ref(heap_id) => match vm.heap.get(*heap_id) {
@@ -302,7 +322,7 @@ fn extract_path_string<'a>(val: &Value, vm: &'a VM<'_, '_, impl ResourceTracker>
     }
 }
 
-fn fold_joinpath(mut path: Path, parts: &[Value], vm: &VM<'_, '_, impl ResourceTracker>) -> RunResult<Path> {
+fn fold_joinpath(mut path: Path, parts: &[Value], vm: &VM<'_, impl ResourceTracker>) -> RunResult<Path> {
     for part in parts {
         path = Path::new(path.joinpath(extract_path_string(part, vm)?));
     }
@@ -474,20 +494,32 @@ impl Path {
 }
 
 impl<'h> PyTrait<'h> for HeapRead<'h, Path> {
-    fn py_type(&self, _vm: &VM<'h, '_, impl ResourceTracker>) -> Type {
+    fn py_type(&self, _vm: &VM<'h, impl ResourceTracker>) -> Type {
         Type::Path
     }
 
-    fn py_len(&self, _vm: &VM<'h, '_, impl ResourceTracker>) -> Option<usize> {
+    fn py_len(&self, _vm: &VM<'h, impl ResourceTracker>) -> Option<usize> {
         // Paths don't have a length in Python
         None
     }
 
-    fn py_eq(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<bool, ResourceError> {
+    fn py_eq(&self, other: &Self, vm: &mut VM<'h, impl ResourceTracker>) -> Result<bool, ResourceError> {
         Ok(self.get(vm.heap).path == other.get(vm.heap).path)
     }
 
-    fn py_bool(&self, _vm: &mut VM<'h, '_, impl ResourceTracker>) -> bool {
+    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<HashValue>> {
+        let p = self.get(vm.heap);
+        if let Some(cached) = p.cached_hash.get() {
+            return Ok(Some(cached));
+        }
+        let mut hasher = DefaultHasher::new();
+        p.as_str().hash(&mut hasher);
+        let hash = HashValue::new(hasher.finish());
+        p.cached_hash.set(Some(hash));
+        Ok(Some(hash))
+    }
+
+    fn py_bool(&self, _vm: &mut VM<'h, impl ResourceTracker>) -> bool {
         // Paths are always truthy (even empty paths)
         true
     }
@@ -495,7 +527,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Path> {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        vm: &VM<'h, '_, impl ResourceTracker>,
+        vm: &mut VM<'h, impl ResourceTracker>,
         _heap_ids: &mut AHashSet<HeapId>,
     ) -> RunResult<()> {
         // Format like: PosixPath('/usr/bin')
@@ -511,7 +543,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Path> {
     fn py_call_attr(
         &mut self,
         self_id: HeapId,
-        vm: &mut VM<'h, '_, impl ResourceTracker>,
+        vm: &mut VM<'h, impl ResourceTracker>,
         attr: &EitherStr,
         args: ArgValues,
     ) -> RunResult<CallResult> {
@@ -584,7 +616,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Path> {
         value.map(CallResult::Value)
     }
 
-    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Option<CallResult>> {
+    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<CallResult>> {
         // Fast path: interned strings can be matched by ID without string comparison
         if let Some(ss) = attr.static_string() {
             if let Some(v) = self.get(vm.heap).getattr_by_static(ss, vm.heap)? {
